@@ -11,4 +11,7 @@ int TCPConnect(char *addr, int port, int nonblock);
 void *chatMalloc(size_t size);
 void *chatRealloc(void *ptr, size_t size);
 
+/* Testing. */
+ssize_t limitedRead(int fd, void *buf, size_t count, size_t limit);
+
 #endif // CHATLIB_H

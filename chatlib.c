@@ -151,3 +151,8 @@ void *chatRealloc(void *ptr, size_t size) {
     }
     return ptr;
 }
+
+ssize_t limitedRead(int fd, void *buf, size_t count, size_t limit) {
+    ssize_t retval = read(fd, buf, count < limit ? count : limit);
+    return retval;
+}
