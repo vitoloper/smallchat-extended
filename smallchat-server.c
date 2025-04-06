@@ -38,6 +38,7 @@
 #include <unistd.h>
 
 #include "chatlib.h"
+#include "circular_buffer.h"
 
 /* ============================ Data structures =================================
  * The minimal stuff we can afford to have. This example must be simple
@@ -48,6 +49,7 @@
 #define SERVER_PORT 7711
 
 #define READBUF_SIZE 128
+#define MSG_SEP '\n' /* Message separator (buffer reads until this char is found) */
 
 /* This structure represents a connected client. There is very little
  * info about it: the socket descriptor and the nick name, if set, otherwise
@@ -56,8 +58,7 @@
 struct client {
     int fd;     // Client socket.
     char *nick; // Nickname of the client.
-    char readbuf[READBUF_SIZE]; // Each client has its own read buffer.
-    int readbuf_i;  // Next free position in readbuf.
+    struct Circbuf *cb; // Circular buffer
 };
 
 /* This global structure encapsulates the global state of the chat. */
@@ -91,12 +92,11 @@ struct client *createClient(int fd) {
     c->nick = chatMalloc(nicklen+1);
     memcpy(c->nick,nick,nicklen);
 
-    /* Set the next free position in readbuf as 0, 
-     * since readbuf is empty when client is first created. */
-    c->readbuf_i = 0;
+    /* Allocate circular buffer. */
+    c->cb = circbuf_alloc(READBUF_SIZE);
+    assert(c->cb != NULL);
     
     assert(Chat->clients[c->fd] == NULL); // This should be available.
-    
     Chat->clients[c->fd] = c;
 
     /* We need to update the max client set if needed. */
@@ -112,6 +112,7 @@ struct client *createClient(int fd) {
 void freeClient(struct client *c) {
     free(c->nick);
     close(c->fd);
+    circbuf_free(c->cb);
     Chat->clients[c->fd] = NULL;
     Chat->numclients--;
     
@@ -171,6 +172,9 @@ void sendMsgToAllClientsBut(int excluded, char *s, size_t len) {
  * 2. Check if any client sent us some new message.
  * 3. Send the message to all the other clients. */
 int main(void) {
+    char tmpbuf[READBUF_SIZE];
+    char readbuf[READBUF_SIZE];
+    int readbuf_idx;
 
     /* Initialize the global Chat state. */
     initChat();
@@ -233,16 +237,22 @@ int main(void) {
                      * message waiting for us. But it is entirely possible
                      * that we read just half a message. In a normal program
                      * that is not designed to be that simple, we should try
-                     * to buffer reads until the end-of-the-line is reached. */
-                    
-                    /* Left space in readbuf, also taking into account the space
-                     * for the final null char. */
-                    int count = READBUF_SIZE - Chat->clients[j]->readbuf_i - 1;
+                     * to buffer reads until the end-of-the-line (or another
+                     * message separator) is reached. */
 
-                    int nread = read(j, 
-                        Chat->clients[j]->readbuf+Chat->clients[j]->readbuf_i, 
-                        count);
-                    
+                    /* Remaining space in circular buffer, also taking into account 
+                     * the space for the final null char. */
+                    int count = circbuf_space_left(Chat->clients[j]->cb) - 1;
+
+                    /* Read data in a temp buffer and then push it in 
+                     * client circular buffer.*/
+                    int nread = read(j, tmpbuf, count);
+                    circbuf_push_from_linear(Chat->clients[j]->cb, tmpbuf, nread);
+                    tmpbuf[nread] = '\0';
+
+                    printf("Client fd=%d\n", j);
+                    /* circbuf_print_data(Chat->clients[j]->cb); */
+
                     if (nread <= 0) {
                         /* Error or short read means that the socket
                          * was closed. */
@@ -250,67 +260,84 @@ int main(void) {
                             j, Chat->clients[j]->nick);
                         freeClient(Chat->clients[j]);
                     } else {
-                        /* Set the next first free position in readbuf. */
-                        Chat->clients[j]->readbuf_i += nread;
+                        /* Count the number of MSG_SEP occurrencies in tmpbuf */
+                        int sep_occur = 0;
+                        for (int i = 0; i < nread; i++) {
+                            if (tmpbuf[i] == MSG_SEP) sep_occur++;
+                        };
 
-                        /* Buffering reads until '\n' is received or readbuf is 
+                        /* Buffering reads until MSG_SEP is received or cb is 
                          * full (taking into account the null-char space). */
-                        if (Chat->clients[j]->readbuf[Chat->clients[j]->readbuf_i - 1] == '\n' || 
-                            Chat->clients[j]->readbuf_i >= READBUF_SIZE-1) {
+                        if (sep_occur > 0 || circbuf_space_left(Chat->clients[j]->cb) <= 1) {
 
                             /* The client sent us a message. We need to
                             * relay this message to all the other clients
                             * in the chat. */
                             struct client *c = Chat->clients[j];
-                            Chat->clients[j]->readbuf[Chat->clients[j]->readbuf_i] = '\0';
 
-                            /* If the user message starts with "/", we
-                            * process it as a client command. So far
-                            * only the /nick <newnick> command is implemented. */
-                            if (Chat->clients[j]->readbuf[0] == '/') {
-                                /* Remove any trailing newline. */
-                                char *p;
-                                p = strchr(Chat->clients[j]->readbuf,'\r'); if (p) *p = 0;
-                                p = strchr(Chat->clients[j]->readbuf,'\n'); if (p) *p = 0;
-                                /* Check for an argument of the command, after
-                                * the space. */
-                                char *arg = strchr(Chat->clients[j]->readbuf,' ');
-                                if (arg) {
-                                    *arg = 0; /* Terminate command name. */
-                                    arg++; /* Argument is 1 byte after the space. */
-                                }
+                            /* Process messages. 
+                             * Example (suppose 'A' is the separator):
+                             * "niceAtoAmeetAyou"
+                             * 
+                             * 'A' occurs 3 times, so we send 3 messages
+                             * niceA, toA, meetA
+                             * "you" is kept in circular buffer and is not sent.
+                             * 
+                             */
+                            for (; sep_occur > 0; sep_occur--) {
+                                readbuf_idx = 0;
+                                do {
+                                    circbuf_pop(c->cb, &readbuf[readbuf_idx]);
+                                } while (readbuf[readbuf_idx++] != MSG_SEP);
+                                readbuf[readbuf_idx] = '\0';
+                                // printf("readbuf: %s\n", readbuf);
 
-                                if (!strcmp(Chat->clients[j]->readbuf,"/nick") && arg) {
-                                    free(c->nick);
-                                    int nicklen = strlen(arg);
-                                    c->nick = chatMalloc(nicklen+1);
-                                    memcpy(c->nick,arg,nicklen+1);
+                                /* If the user message starts with "/", we
+                                * process it as a client command. So far
+                                * only the /nick <newnick> command is implemented. */
+                                if (readbuf[0] == '/') {
+                                    /* Remove any trailing newline. */
+                                    char *p;
+                                    p = strchr(readbuf,'\r'); if (p) *p = 0;
+                                    p = strchr(readbuf,'\n'); if (p) *p = 0;
+                                    /* Check for an argument of the command, after
+                                    * the space. */
+                                    char *arg = strchr(readbuf,' ');
+                                    if (arg) {
+                                        *arg = 0; /* Terminate command name. */
+                                        arg++; /* Argument is 1 byte after the space. */
+                                    }
+
+                                    if (!strcmp(readbuf,"/nick") && arg) {
+                                        free(c->nick);
+                                        int nicklen = strlen(arg);
+                                        c->nick = chatMalloc(nicklen+1);
+                                        memcpy(c->nick,arg,nicklen+1);
+                                    } else {
+                                        /* Unsupported command. Send an error. */
+                                        char *errmsg = "Unsupported command\n";
+                                        write(c->fd,errmsg,strlen(errmsg));
+                                    }
                                 } else {
-                                    /* Unsupported command. Send an error. */
-                                    char *errmsg = "Unsupported command\n";
-                                    write(c->fd,errmsg,strlen(errmsg));
+                                    /* Create a message to send everybody (and show
+                                    * on the server console) in the form:
+                                    *   nick> some message. */
+                                    char msg[256];
+                                    int msglen = snprintf(msg, sizeof(msg),
+                                        "%s> %s", c->nick, readbuf);
+
+                                    /* snprintf() return value may be larger than
+                                    * sizeof(msg) in case there is no room for the
+                                    * whole output. */
+                                    if (msglen >= (int)sizeof(msg))
+                                        msglen = sizeof(msg)-1;
+                                    
+                                    printf("%s", msg);
+
+                                    /* Send it to all the other clients. */
+                                    sendMsgToAllClientsBut(j, msg, msglen);
                                 }
-                            } else {
-                                /* Create a message to send everybody (and show
-                                * on the server console) in the form:
-                                *   nick> some message. */
-                                char msg[256];
-                                int msglen = snprintf(msg, sizeof(msg),
-                                    "%s> %s", c->nick, Chat->clients[j]->readbuf);
-
-                                /* snprintf() return value may be larger than
-                                * sizeof(msg) in case there is no room for the
-                                * whole output. */
-                                if (msglen >= (int)sizeof(msg))
-                                    msglen = sizeof(msg)-1;
-                                
-                                printf("%s", msg);
-
-                                /* Send it to all the other clients. */
-                                sendMsgToAllClientsBut(j, msg, msglen);
                             }
-
-                            Chat->clients[j]->readbuf_i = 0;
                         } else {
                             /* Do nothing, keep buffering with the next read. */
                         }
