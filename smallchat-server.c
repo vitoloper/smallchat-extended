@@ -250,7 +250,7 @@ int main(void) {
                     circbuf_push_from_linear(Chat->clients[j]->read_cb, tmpbuf, nread);
                     tmpbuf[nread] = '\0';
 
-                    printf("Client fd=%d\n", j);
+                    /* printf("Client fd=%d\n", j); */
                     /* circbuf_print_data(Chat->clients[j]->read_cb); */
 
                     if (nread <= 0) {
@@ -284,6 +284,11 @@ int main(void) {
                              * "you" is kept in circular buffer and is not sent.
                              * 
                              */
+
+                            /* If sep_occur is 0 and we are here, it means cb is full. 
+                             * So, set sep_occur to 1 to send the whole buffer once. */
+                            if (sep_occur == 0) sep_occur = 1;
+
                             for (; sep_occur > 0; sep_occur--) {
                                 readbuf_idx = 0;
                                 do {
