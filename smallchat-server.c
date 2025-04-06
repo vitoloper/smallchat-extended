@@ -58,7 +58,7 @@
 struct client {
     int fd;     // Client socket.
     char *nick; // Nickname of the client.
-    struct Circbuf *cb; // Circular buffer
+    struct Circbuf *read_cb; // Circular buffer
 };
 
 /* This global structure encapsulates the global state of the chat. */
@@ -93,8 +93,8 @@ struct client *createClient(int fd) {
     memcpy(c->nick,nick,nicklen);
 
     /* Allocate circular buffer. */
-    c->cb = circbuf_alloc(READBUF_SIZE);
-    assert(c->cb != NULL);
+    c->read_cb = circbuf_alloc(READBUF_SIZE);
+    assert(c->read_cb != NULL);
     
     assert(Chat->clients[c->fd] == NULL); // This should be available.
     Chat->clients[c->fd] = c;
@@ -112,7 +112,7 @@ struct client *createClient(int fd) {
 void freeClient(struct client *c) {
     free(c->nick);
     close(c->fd);
-    circbuf_free(c->cb);
+    circbuf_free(c->read_cb);
     Chat->clients[c->fd] = NULL;
     Chat->numclients--;
     
@@ -242,16 +242,16 @@ int main(void) {
 
                     /* Remaining space in circular buffer, also taking into account 
                      * the space for the final null char. */
-                    int count = circbuf_space_left(Chat->clients[j]->cb) - 1;
+                    int count = circbuf_space_left(Chat->clients[j]->read_cb) - 1;
 
                     /* Read data in a temp buffer and then push it in 
                      * client circular buffer.*/
                     int nread = read(j, tmpbuf, count);
-                    circbuf_push_from_linear(Chat->clients[j]->cb, tmpbuf, nread);
+                    circbuf_push_from_linear(Chat->clients[j]->read_cb, tmpbuf, nread);
                     tmpbuf[nread] = '\0';
 
                     printf("Client fd=%d\n", j);
-                    /* circbuf_print_data(Chat->clients[j]->cb); */
+                    /* circbuf_print_data(Chat->clients[j]->read_cb); */
 
                     if (nread <= 0) {
                         /* Error or short read means that the socket
@@ -266,9 +266,9 @@ int main(void) {
                             if (tmpbuf[i] == MSG_SEP) sep_occur++;
                         };
 
-                        /* Buffering reads until MSG_SEP is received or cb is 
+                        /* Buffering reads until MSG_SEP is received or read_cb is 
                          * full (taking into account the null-char space). */
-                        if (sep_occur > 0 || circbuf_space_left(Chat->clients[j]->cb) <= 1) {
+                        if (sep_occur > 0 || circbuf_space_left(Chat->clients[j]->read_cb) <= 1) {
 
                             /* The client sent us a message. We need to
                             * relay this message to all the other clients
@@ -287,7 +287,7 @@ int main(void) {
                             for (; sep_occur > 0; sep_occur--) {
                                 readbuf_idx = 0;
                                 do {
-                                    circbuf_pop(c->cb, &readbuf[readbuf_idx]);
+                                    circbuf_pop(c->read_cb, &readbuf[readbuf_idx]);
                                 } while (readbuf[readbuf_idx++] != MSG_SEP);
                                 readbuf[readbuf_idx] = '\0';
                                 // printf("readbuf: %s\n", readbuf);
